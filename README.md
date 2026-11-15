@@ -136,6 +136,7 @@ Record 202 is small enough that the pooled DS2 numbers barely move, but for that
 pip install -r requirements.txt
 python scripts/fetch_data.py                 # downloads MIT-BIH from PhysioNet, builds data/processed/beats.npz
 python -m shiftlab.experiments all           # E1 to E5, about an hour on 2 CPU cores
+python -m shiftlab.experiments unseen        # GBM rows of E1 only, under a minute
 python scripts/dev_ds1.py                    # DS1-only model selection
 python -m shiftlab.experiments v2            # selected candidate on DS2, once
 python scripts/make_figures.py

@@ -5,6 +5,7 @@
     python -m shiftlab.experiments cv          # E3  patient-wise vs beat-wise CV, per patient
     python -m shiftlab.experiments subject     # E4  the 201/202 same-subject overlap
     python -m shiftlab.experiments identity    # E5  how recognisable is a patient?
+    python -m shiftlab.experiments unseen      #     E1, GBM rows only (minutes, no CNNs)
     python -m shiftlab.experiments v2          #     DS1-selected candidate, DS2 once
     python -m shiftlab.experiments all         # E1-E5
 """
@@ -42,6 +43,18 @@ def _assert_disjoint(d, tr, te, level="subject"):
 
 def _reps(d):
     return {m: F.represent(d, m) for m in MODES}
+
+
+LABEL = {"raw": "raw", "pnorm": "normalised", "template": "relative"}
+RULE = "\u2500"
+
+
+def _head(*lines, cols, width=None):
+    for ln in lines:
+        print(ln)
+    print()
+    print(cols)
+    print(RULE * (width or len(cols)), flush=True)
 
 
 # ----------------------------------------------------------------------------- E1
@@ -86,6 +99,25 @@ def benchmark(d, reps, cnn_seeds=(0, 1, 2)):
     _save("benchmark", out)
 
 
+def unseen(d, reps):
+    """GBM rows of E1 on their own: train on DS1, test on the 22 unseen DS2 records."""
+    y, rec = d["y"], d["rec"]
+    tr, te = np.isin(rec, C.DS1), np.isin(rec, C.DS2)
+    _assert_disjoint(d, tr, te, level="rec")
+    _head("train: DS1, 22 records \u00b7 test: DS2, 22 unseen records",
+          "95% intervals: 2,000 bootstrap resamples over patients",
+          cols="features     acc     F1 S                F1 V", width=56)
+    out = {}
+    for mode in MODES:
+        s, t = reps[mode]
+        p = M.predict_gbm(M.fit_gbm(s[tr], t[tr], y[tr]), s[te], t[te]).argmax(1)
+        m_, ci = E.score(y[te], p), E.cluster_bootstrap(y[te], p, rec[te])
+        out[mode] = {"metrics": m_, "ci95": ci}
+        f = lambda k_: f"{m_[k_]:.2f} [{ci[k_][0]:.2f}, {ci[k_][1]:.2f}]"
+        print(f"{LABEL[mode]:<13}{m_['acc']:.3f}   {f('f1_S')}   {f('f1_V')}", flush=True)
+    _save("unseen", out)
+
+
 # ----------------------------------------------------------------------------- E2
 def _leak_split(d):
     rec = d["rec"]
@@ -110,6 +142,9 @@ def leakage(d, reps, n_total=40000, fracs=(0, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25
     y, rec = d["y"], d["rec"]
     ds1, test, pool = _leak_split(d)
     out = {"n_total": n_total, "n_test": int(len(test)), "curve": {}}
+    _head(f"test beats fixed: {len(test):,} (half of every test patient's record)",
+          f"training set fixed: {n_total:,} beats \u00b7 {len(seeds)} resamples per row",
+          cols="features   from test patients      F1 S   F1 V")
     for mode in ("raw", "template"):
         s, t = reps[mode]
         rows = []
@@ -122,8 +157,9 @@ def leakage(d, reps, n_total=40000, fracs=(0, 0.005, 0.01, 0.02, 0.05, 0.1, 0.25
                              "n_leaked_by_class": np.bincount(y[idx[n_total - k:]], minlength=4).tolist(),
                              **E.score(y[test], p), **E.patient_mean(y[test], p, rec[test])})
             last = [r_ for r_ in rows if r_["frac"] == f]
-            print(mode, f, "pooled S %.3f V %.3f | patient-mean S %.3f V %.3f" % tuple(
-                np.mean([r_[k_] for r_ in last]) for k_ in ("f1_S", "f1_V", "pm_f1_S", "pm_f1_V")), flush=True)
+            m_ = {k_: np.mean([r_[k_] for r_ in last]) for k_ in ("f1_S", "f1_V")}
+            print(f"{LABEL[mode]:<11}{f:>5.1%}  {last[0]['n_leaked']:>6,} beats      "
+                  f"{m_['f1_S']:.2f}   {m_['f1_V']:.2f}", flush=True)
         out["curve"][mode] = rows
     _save("leakage", out)
 
@@ -155,6 +191,8 @@ def cv(d, reps, k=11, seed=0):
     folds = {"patient": np.array([fold_of_subject[s_] for s_ in sub]),
              "beat": rng.integers(0, k, len(y))}
     out = {}
+    _head(f"cross-validation \u00b7 {k} folds \u00b7 {len(subjects)} patients \u00b7 {len(y):,} beats",
+          cols="features   test folds made of   acc     F1 S   F1 V")
     for mode in ("raw", "template"):
         s, t = reps[mode]
         for kind, fold in folds.items():
@@ -168,8 +206,14 @@ def cv(d, reps, k=11, seed=0):
             out[f"{mode}/{kind}"] = {"metrics": E.score(y, pred),
                                      "ci95": E.cluster_bootstrap(y, pred, sub),
                                      "per_record": E.per_group(y, pred, rec)}
-            print(mode, kind, {k_: round(v, 3) for k_, v in out[f'{mode}/{kind}']['metrics'].items()
-                               if k_.startswith(('f1', 'macro', 'acc'))}, flush=True)
+            m_ = out[f"{mode}/{kind}"]["metrics"]
+            name = "whole patients" if kind == "patient" else "shuffled beats"
+            print(f"{LABEL[mode]:<11}{name:<21}{m_['acc']:.3f}   {m_['f1_S']:.2f}   {m_['f1_V']:.2f}", flush=True)
+    pr = out["template/patient"]["per_record"]
+    vals = np.array([v["f1_S"] for v in pr.values() if v["support"][1] >= 20])
+    print(f"\nrelative features, supraventricular F1 per unseen patient")
+    print(f"{len(vals)} patients with 20+ such beats: median {np.median(vals):.2f}, "
+          f"{int((vals < 0.5).sum())} below 0.50")
     _save("cv", out)
 
 
@@ -180,6 +224,9 @@ def subject(d, reps, seeds=(0, 1, 2, 3, 4)):
     te202 = rec == "202"
     te_rest = np.isin(rec, C.DS2) & ~te202
     out = {}
+    _head("records 201 and 202 are the same patient (MIT-BIH directory)",
+          f"standard split: 201 in training, 202 in test \u00b7 {len(seeds)} seeds",
+          cols="features   201 in training   F1 S on 202   F1 V on 202")
     for mode in ("raw", "template"):
         s, t = reps[mode]
         for name, train_recs in (("with_201", C.DS1), ("without_201", [r for r in C.DS1 if r != "201"])):
@@ -190,10 +237,9 @@ def subject(d, reps, seeds=(0, 1, 2, 3, 4)):
                 rows.append({"on_202": E.score(y[te202], M.predict_gbm(g, s[te202], t[te202]).argmax(1)),
                              "on_rest": E.score(y[te_rest], M.predict_gbm(g, s[te_rest], t[te_rest]).argmax(1))})
             out[f"{mode}/{name}"] = rows
-            print(mode, name, "202: S %.3f V %.3f | rest: S %.3f V %.3f" % (
-                np.mean([r_["on_202"]["f1_S"] for r_ in rows]), np.mean([r_["on_202"]["f1_V"] for r_ in rows]),
-                np.mean([r_["on_rest"]["f1_S"] for r_ in rows]), np.mean([r_["on_rest"]["f1_V"] for r_ in rows])),
-                flush=True)
+            g_ = lambda k_: np.mean([r_["on_202"][k_] for r_ in rows])
+            print(f"{LABEL[mode]:<11}{'yes' if name == 'with_201' else 'no':<18}"
+                  f"{g_('f1_S'):>11.2f}{g_('f1_V'):>14.2f}", flush=True)
     out["support_202"] = E.confusion(y[te202], y[te202]).sum(1).tolist()
     _save("subject", out)
 
@@ -248,8 +294,9 @@ def main():
     if which == "v2":
         return v2(d)
     reps = _reps(d)
-    jobs = {"benchmark": benchmark, "leakage": leakage, "leakage_cnn": leakage_cnn, "cv": cv, "subject": subject, "identity": identity}
-    for name in (jobs if which == "all" else [which]):
+    jobs = {"benchmark": benchmark, "unseen": unseen, "leakage": leakage, "leakage_cnn": leakage_cnn, "cv": cv, "subject": subject, "identity": identity}
+    names = [n for n in jobs if n not in ("unseen", "leakage_cnn")] if which == "all" else [which]
+    for name in names:
         t0 = time.time()
         jobs[name](d, reps)
         print(f"== {name} done in {time.time() - t0:.0f}s", flush=True)
