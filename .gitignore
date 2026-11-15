@@ -1,0 +1,6 @@
+data/
+__pycache__/
+*.pyc
+results/run.log
+results/*.npz
+.DS_Store
